@@ -24,19 +24,10 @@
  *******************************************************************************************************/
 #include "app_config.h"
 #include "app_sin_data.h"
-#include "algo/compressor.h"
-// #include "algo/drc_config.h"
 #include <string.h>
 
-#define Fixed  1
-#define DRCOPT 0
-#if Fixed
 #include "algo/nsx.h"
 #include "algo/agc.h"
-#else
-#include "algo/ns_core.h"
-#include "algo/defines.h"
-#endif
 
 unsigned int dma_rx_irq_cnt = 0;
 #if ((AUDIO_MODE == LINEIN_TO_LINEOUT) || (AUDIO_MODE == AMIC_TO_LINEOUT) ||                       \
@@ -56,21 +47,12 @@ volatile unsigned int mcu_dst_wb = 0;
 /* addr除以4096的余数 */
 #define ALIGN_BUFFER(addr) ((addr) & (AUDIO_BUFF_SIZE - 1))
 
-// TODO: 添加处理右声道的指针
-#if DRCOPT
-void *DRC_instL = NULL;
-#endif
-#if Fixed
 void *pNS_instL = NULL;
-void *AGC_inst = NULL;
+void *AGC_instL = NULL;
 InnoTalkAgc_config_t agcConfig;
-// void *pNS_instR = NULL;
-#if TelinkOPT && LIIROPT
+#if LIIROPT
 void *HPF_instL = NULL;
 #define nstage        (3)   //hpf阶数
-#endif
-#else
-NSinst_t *pNS_instL = NULL;
 #endif
 
 #elif (AUDIO_MODE == BUFFER_TO_LINEOUT)
@@ -97,48 +79,8 @@ volatile unsigned char swith;
 unsigned long t;
 #endif
 
-#if DRCOPT
-/**
- * @brief 创建并初始化drc结构体
- * TODO: 添加右指针的初始化
- * @param fs 采样频率
- */
-void drc_init(uint32_t fs)
-{
-    // DRC参数: 预增益, threshold, knee, ratio, attack time, release time
-	float params[6] = { 0.0f,-20.000f,10.000f,8.000f,0.003f,0.25f };
-	DRC_inst = InnoTalkDRC_Init(fs, params[0], params[1], params[2], params[3], params[4], params[5],
-				0.006f, // pre_delay
-				0.090f, // releasezone1
-				0.160f, // releasezone2
-				0.420f, // releasezone3
-				0.980f, // releasezone4
-				0.000f, // post_gain
-				1.000f);  // wet
-}
 
-/**
- * @brief 对输入的信号以128点为块做drc
- *
- * @param in 输入信号
- * @param out 输出信号
- * @param len 信号长度, 以byte为单位
- */
-void drc(void* inst, signed short *in, signed short *out, int len)
-{
-    signed short *data = in;
-    signed short *post = out;
-
-    while (len) {
-    	Drc_Process(inst, FRAME_LEN, data, post);
-        len -= FRAME_LEN * sizeof(signed short);
-        data += FRAME_LEN;
-        post += FRAME_LEN;
-    }
-}
-#endif
-
-#if  Fixed && TelinkOPT && LIIROPT
+#if LIIROPT
 /**
  * @brief 对输入的信号以128点为块做hpf
  *
@@ -167,19 +109,16 @@ void hpfprocess(void* inst, signed short *in, signed short *out, int len)
  * @param out 输出信号
  * @param len 信号长度, 以byte为单位
  */
-void nsprocess(void* inst, signed short *in, signed short *out, int len)
+void audioProcess(void* ns_inst, void* agc_inst, signed short *in, signed short *out, int len)
 {
     signed short *data = in;
     signed short *post = out;
     signed short tmp[FRAME_LEN] = { 0 };
 
     while (len) {
-#ifdef Fixed
-    	InnoTalkNsx_ProcessCore(inst, data, tmp);
-    	InnoTalkAgc_Process(AGC_inst, tmp, post, agcConfig);
-#else
-    	InnoTalkNs_ProcessCore(inst, data, NULL, post, NULL);
-#endif
+    	InnoTalkNsx_ProcessCore(ns_inst, data, tmp);
+    	InnoTalkAgc_Process(agc_inst, tmp, post, agcConfig);
+
         len -= FRAME_LEN * sizeof(signed short);
         data += FRAME_LEN;
         post += FRAME_LEN;
@@ -192,8 +131,6 @@ int split_data_to_lr(signed short *data __attribute__((unused)), signed short *l
     for (int i = 0; i < (len >> 2); i++) {
         l[i] = data[i * 2];
         r[i] = data[i * 2 + 1];
-        // l[i] = 0;
-        // r[i] = 0;
     }
     return len >> 1;
 }
@@ -203,8 +140,6 @@ int converge_lr_to_data(signed short *l __attribute__((unused)), signed short *r
     for (int i = 0; i < (len >> 1); i++) {
         data[i * 2] = l[i];
         data[i * 2 + 1] = r[i];
-   	    // data[i * 2] = 0;
-   	    // data[i * 2 + 1] = 0;
     }
     return len << 1;
 }
@@ -257,8 +192,7 @@ void audio_loopback()
         //}
 
         // ! 调用语音处理算法
-        // drc(DRC_instL, l, post, bytes);
-        nsprocess(pNS_instL, l, post_l, bytes);
+        audioProcess(pNS_instL, AGC_instL, l, post_l, bytes);
         // FIXME: 耳机只播放左声道
         converge_lr_to_data(post_l, r, (signed short *)(audio_tx + (mcu_dst_wb >> 1)), bytes);
 
@@ -370,41 +304,30 @@ void user_init()
 #elif (AUDIO_MODE == AMIC_TO_LINEOUT)
 
 // ! 初始化
-// TODO: 添加右指针的初始化
-#if DRCOPT
-    drc_init(16000);
-#endif
-#if Fixed
-#if TelinkOPT && LIIROPT
+#if LIIROPT
     float rcoeff[nstage] = {-0.8876, 0.9983, -0.9989}; // hpf r系数, 和matlab的k系数倒序
     float lcoeff[nstage + 1] = {-0.94252, 0.11082, 0.00464, -0.000016}; //hpf l系数, 和matlab的v系数倒序
     InnoTalkHpf_Create(&HPF_instL);
     InnoTalkHpf_InitCore(HPF_instL, rcoeff, lcoeff, nstage);
 #endif
 	InnoTalkNsx_Create(&pNS_instL);
-	InnoTalkNsx_InitCore(pNS_instL, 16000);
+	InnoTalkNsx_InitCore(pNS_instL, (uint32_t)16000);
 
-	InnoTalkAgc_Create(&AGC_inst);
-	int minLevel = 0;
-	int maxLevel = 255;
+	InnoTalkAgc_Create(&AGC_instL);
+	int32_t minLevel = 0;
+	int32_t maxLevel = 255;
 	// int agcMode = kAgcModeAdaptiveDigital;
-	InnoTalkAgc_Init(AGC_inst, minLevel, maxLevel, 16000);
-	agcConfig.compressionGaindB = 15;
-	agcConfig.limiterEnable = 1;
-	agcConfig.targetLevelDbfs = 6;
-	agcConfig.SilenceGainFall = 110;
-	agcConfig.AgcVadLowThr = 0;                //JT:AGC中VAD判定低门限,Q10，推荐值为0
-	agcConfig.AgcVadUppThr = 1024;             //JT:AGC中VAD判定高门限,Q10，推荐值为1024
-	agcConfig.GateLowThr = 0;                  //JT:Gate判定低门限，推荐值为0
-	agcConfig.GateUppThr = 2500;               //JT:Gate判定高门限，推荐值为2500
-	agcConfig.GateVadSensitivity = 6;             //JT:Gate计算对语音活性的敏感度，推荐值为6
-	InnoTalkAgc_set_config(AGC_inst, agcConfig);
-    // InnoTalkNsx_Create(&pNS_instR);
-    // InnoTalkNsx_InitCore(pNS_instR, 16000);
-#else
-	InnoTalkNs_CreateN(&pNS_instL);
-	InnoTalkNs_InitCore(pNS_instL, 16000);
-#endif
+	InnoTalkAgc_Init(AGC_instL, minLevel, maxLevel, (uint32_t)16000);
+	agcConfig.compressionGaindB = (int16_t)18;
+	agcConfig.limiterEnable = (uint8_t)1;
+	agcConfig.targetLevelDbfs = (int16_t)3;
+	agcConfig.SilenceGainFall = (int16_t)110;
+	agcConfig.AgcVadLowThr = (int16_t)0;                //JT:AGC中VAD判定低门限,Q10，推荐值为0
+	agcConfig.AgcVadUppThr = (int16_t)1024;             //JT:AGC中VAD判定高门限,Q10，推荐值为1024
+	agcConfig.GateLowThr = (int16_t)0;                  //JT:Gate判定低门限，推荐值为0
+	agcConfig.GateUppThr = (int16_t)2500;               //JT:Gate判定高门限，推荐值为2500
+	agcConfig.GateVadSensitivity = (int16_t)6;             //JT:Gate计算对语音活性的敏感度，推荐值为6
+	InnoTalkAgc_set_config(AGC_instL, agcConfig);
 
     audio_init(AMIC_IN_TO_BUF_TO_LINE_OUT, AUDIO_16K, STEREO_BIT_16);
     // audio_rx_dma_chain_init(DMA2, (unsigned short *)AUDIO_BUFF, AUDIO_BUFF_SIZE);
@@ -412,7 +335,8 @@ void user_init()
     interrupt_init();
 	audio_rx_dma_chain_init(DMA2, (unsigned short *)audio_rx, AUDIO_BUFF_SIZE);
 	audio_tx_dma_chain_init(DMA3, (unsigned short *)audio_tx, AUDIO_BUFF_SIZE);
-	audio_set_codec_adc_wnf(CODEC_ADC_WNF_MODE3); //HFP
+	// ! 定义ADC寄存器的HPF
+    audio_set_codec_adc_wnf(CODEC_ADC_WNF_MODE3); //HFP
 #elif (AUDIO_MODE == DMIC_TO_LINEOUT)
     /* this branch */
     /* init state */

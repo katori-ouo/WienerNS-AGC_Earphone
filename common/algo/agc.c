@@ -433,7 +433,7 @@ void InnoTalkAgc_InitVad(AgcVad_t *state)
 int InnoTalkAgc_Create(void **agcInst)
 {
 
-    Agc_t *stt = &agcFixed.fs;
+    Agc_t *stt = &agcFixed;
 
 	*agcInst = stt;
 
